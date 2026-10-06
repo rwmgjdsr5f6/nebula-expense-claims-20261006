@@ -1,6 +1,6 @@
-"""命令行接口：提交报销单、按提交人查询与汇总。
+"""命令行接口：提交报销单、按提交人查询、汇总与导出 CSV。
 
-入口：``python -m expense_desk --db <SQLite 文件> <submit|list|summary> ...``
+入口：``python -m expense_desk --db <SQLite 文件> <submit|list|summary|export> ...``
 
 仅依赖 Python 3 标准库，金额以整数分（人民币）存储，不经过浮点运算。
 """
@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import re
 import sqlite3
@@ -111,6 +113,9 @@ def build_parser() -> argparse.ArgumentParser:
     summary = subparsers.add_parser("summary", help="按提交人汇总笔数与金额")
     summary.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
 
+    export = subparsers.add_parser("export", help="按提交人导出报销单 CSV")
+    export.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+
     return parser
 
 
@@ -157,6 +162,30 @@ def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
         }
         for row in rows
     ]
+
+
+def _render_csv(records: list[dict[str, object]]) -> str:
+    """把报销单记录渲染为 CSV 文本。
+
+    首行为固定表头，之后按 id 升序（查询已保证）逐行输出。
+    金额直接输出整数分的十进制写法；文本字段按 CSV 规则处理：
+    含逗号、双引号或换行的字段加双引号，字段内双引号写成两个。
+    每条记录以 CRLF 结束，字段内已有换行原样保留。
+    """
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(["id", "submitter", "purpose", "amount_minor", "status"])
+    for record in records:
+        writer.writerow(
+            [
+                record["id"],
+                record["submitter"],
+                record["purpose"],
+                record["amount_minor"],
+                record["status"],
+            ]
+        )
+    return buffer.getvalue()
 
 
 def _summarize_expenses(db_path: str, submitter: str) -> dict[str, object]:
@@ -206,10 +235,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             records = _query_expenses(args.db, submitter)
             print(json.dumps(records, ensure_ascii=False))
             return 0
-        else:  # summary
+        elif args.command == "summary":
             submitter = _clean_name("提交人(submitter)", args.submitter)
             result = _summarize_expenses(args.db, submitter)
             print(json.dumps(result, ensure_ascii=False))
+            return 0
+        else:  # export
+            submitter = _clean_name("提交人(submitter)", args.submitter)
+            # 先完成查询再输出：数据库失败时不向标准输出写任何内容。
+            records = _query_expenses(args.db, submitter)
+            sys.stdout.write(_render_csv(records))
             return 0
     except ValidationError as exc:
         print(f"参数错误: {exc}", file=sys.stderr)
