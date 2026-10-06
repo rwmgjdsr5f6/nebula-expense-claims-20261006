@@ -42,21 +42,22 @@ class ValidationError(ValueError):
     """参数校验失败（退出码 2）。"""
 
 
-def parse_amount(raw: str) -> int:
+def parse_amount(raw: str, field_label: str = "金额") -> int:
     """把人民币元金额字符串转换为整数分。
 
     接受去除首尾空白后形如 ``12``、``12.3``、``12.30`` 的字符串，
     分别得到 1200、1230、1230。纯字符串十进制运算，不受浮点舍入影响。
+    ``field_label`` 用于在校验错误信息中指认字段（提交金额或一次性预算）。
 
     拒绝空串、零、负数、科学计数法、超过两位小数及其他格式。
     """
     text = raw.strip()
     if not text:
-        raise ValidationError("金额去除首尾空白后不能为空")
+        raise ValidationError(f"{field_label}去除首尾空白后不能为空")
     match = _AMOUNT_RE.fullmatch(text)
     if match is None:
         raise ValidationError(
-            "金额格式无效，仅接受 ASCII 数字整数，或整数部分加小数点及一至两位小数"
+            f"{field_label}格式无效，仅接受 ASCII 数字整数，或整数部分加小数点及一至两位小数"
         )
     whole, fraction = match.group(1), match.group(2)
     # 通过字符串拼接补到两位小数，避免任何浮点舍入。
@@ -67,7 +68,7 @@ def parse_amount(raw: str) -> int:
         # 整数部分全为零，数值完全由两位小数决定（0 到 99 分）。
         minor = int(frac2)
         if minor == 0:
-            raise ValidationError("金额必须大于零")
+            raise ValidationError(f"{field_label}必须大于零")
         return minor
     digits = whole_significant + frac2
     # 用十进制字符串按长度再按字典序与上限比较，避免把超长数字串交给
@@ -78,7 +79,7 @@ def parse_amount(raw: str) -> int:
         len(digits) == len(max_digits) and digits > max_digits
     ):
         raise ValidationError(
-            "金额换算为分后超过 SQLite 64 位有符号整数上限 "
+            f"{field_label}换算为分后超过 SQLite 64 位有符号整数上限 "
             f"({MAX_AMOUNT_MINOR})"
         )
     # 至此数字串长度不超过上限的位数，int() 转换必然成功。
@@ -114,6 +115,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     summary = subparsers.add_parser("summary", help="按提交人汇总笔数与金额")
     summary.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+    summary.add_argument(
+        "--budget",
+        help="可选一次性预算参考（人民币元）；格式与上限同提交金额，不落库",
+    )
 
     export = subparsers.add_parser("export", help="按提交人导出报销单 CSV 到标准输出")
     export.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
@@ -166,7 +171,9 @@ def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
     ]
 
 
-def _summarize_expenses(db_path: str, submitter: str) -> dict[str, object]:
+def _summarize_expenses(
+    db_path: str, submitter: str, budget_minor: int | None = None
+) -> dict[str, object]:
     conn = _connect(db_path)
     try:
         conn.execute(_SCHEMA)
@@ -181,11 +188,17 @@ def _summarize_expenses(db_path: str, submitter: str) -> dict[str, object]:
     total = 0
     for row in rows:
         total += int(row[0])
-    return {
+    result: dict[str, object] = {
         "submitter": submitter,
         "count": len(rows),
         "total_amount_minor": total,
     }
+    # 预算仅供当次参考、不写库；为正时表示尚有剩余，零表示刚好用完，
+    # 为负表示已经超额。差额与合计一样按任意精度整数计算与输出。
+    if budget_minor is not None:
+        result["budget_amount_minor"] = budget_minor
+        result["remaining_amount_minor"] = budget_minor - total
+    return result
 
 
 def _write_csv(records: list[dict[str, object]]) -> None:
@@ -234,7 +247,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         else:  # summary
             submitter = _clean_name("提交人(submitter)", args.submitter)
-            result = _summarize_expenses(args.db, submitter)
+            # 预算先于数据库连接完成校验：预算无效与数据库路径无效同时
+            # 出现时优先生效参数错误（退出码 2），且不会创建数据库文件。
+            budget_minor = (
+                parse_amount(args.budget, "预算(budget)")
+                if args.budget is not None
+                else None
+            )
+            result = _summarize_expenses(args.db, submitter, budget_minor)
             print(json.dumps(result, ensure_ascii=False))
             return 0
     except ValidationError as exc:
