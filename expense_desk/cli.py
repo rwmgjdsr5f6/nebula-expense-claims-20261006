@@ -1,6 +1,6 @@
-"""命令行接口：提交报销单、按提交人查询。
+"""命令行接口：提交报销单、按提交人查询或汇总。
 
-入口：``python -m expense_desk --db <SQLite 文件> <submit|list> ...``
+入口：``python -m expense_desk --db <SQLite 文件> <submit|list|summary> ...``
 
 仅依赖 Python 3 标准库，金额以整数分（人民币）存储，不经过浮点运算。
 """
@@ -94,6 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
     listing = subparsers.add_parser("list", help="按提交人查询报销单")
     listing.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
 
+    summary = subparsers.add_parser("summary", help="按提交人汇总笔数与金额")
+    summary.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+
     return parser
 
 
@@ -142,6 +145,22 @@ def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
     ]
 
 
+def _summarize_expenses(db_path: str, submitter: str) -> tuple[int, int]:
+    conn = _connect(db_path)
+    try:
+        conn.execute(_SCHEMA)
+        rows = conn.execute(
+            "SELECT amount_minor FROM expenses WHERE submitter = ?",
+            (submitter,),
+        ).fetchall()
+    finally:
+        conn.close()
+    # 在 Python 中按任意精度整数求和：SQLite 的 SUM() 受 64 位有符号整数
+    # 限制，合计超限时直接报错；逐行取出后相加可返回完整精确总额。
+    total = sum(int(row[0]) for row in rows)
+    return len(rows), total
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -162,6 +181,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "amount_minor": amount_minor,
                 "status": STATUS_PENDING,
             }
+        elif args.command == "summary":
+            submitter = _clean_name("提交人(submitter)", args.submitter)
+            count, total = _summarize_expenses(args.db, submitter)
+            result = {
+                "submitter": submitter,
+                "count": count,
+                "total_amount_minor": total,
+            }
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
         else:  # list
             submitter = _clean_name("提交人(submitter)", args.submitter)
             records = _query_expenses(args.db, submitter)
