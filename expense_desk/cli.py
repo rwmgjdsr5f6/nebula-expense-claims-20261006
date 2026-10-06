@@ -85,6 +85,19 @@ def parse_amount(raw: str) -> int:
     return int(digits)
 
 
+def parse_budget(raw: str) -> int:
+    """把一次性预算金额（人民币元）转换为整数分。
+
+    预算仅供 summary 当次参考，格式与上限与提交金额完全一致，直接复用
+    :func:`parse_amount` 的换算与拒绝规则；错误信息改述为预算无效，
+    以便与提交金额的参数错误区分。
+    """
+    try:
+        return parse_amount(raw)
+    except ValidationError as exc:
+        raise ValidationError(f"预算无效：{exc}") from None
+
+
 def _clean_name(field_label: str, value: str) -> str:
     cleaned = value.strip()
     if not cleaned:
@@ -114,6 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     summary = subparsers.add_parser("summary", help="按提交人汇总笔数与金额")
     summary.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+    summary.add_argument(
+        "--budget",
+        help="可选的一次性预算参考（人民币元）；提供时额外返回预算分与余额分",
+    )
 
     export = subparsers.add_parser("export", help="按提交人导出报销单 CSV 到标准输出")
     export.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
@@ -166,7 +183,9 @@ def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
     ]
 
 
-def _summarize_expenses(db_path: str, submitter: str) -> dict[str, object]:
+def _summarize_expenses(
+    db_path: str, submitter: str, budget_minor: int | None = None
+) -> dict[str, object]:
     conn = _connect(db_path)
     try:
         conn.execute(_SCHEMA)
@@ -181,11 +200,17 @@ def _summarize_expenses(db_path: str, submitter: str) -> dict[str, object]:
     total = 0
     for row in rows:
         total += int(row[0])
-    return {
+    result: dict[str, object] = {
         "submitter": submitter,
         "count": len(rows),
         "total_amount_minor": total,
     }
+    if budget_minor is not None:
+        # 预算只供当次参考、不落库；余额为预算减合计的任意精度整数差，
+        # 合计超过单笔上限时仍可得到精确的（可能为负的）完整十进制值。
+        result["budget_amount_minor"] = budget_minor
+        result["remaining_amount_minor"] = budget_minor - total
+    return result
 
 
 def _write_csv(records: list[dict[str, object]]) -> None:
@@ -233,8 +258,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_csv(records)
             return 0
         else:  # summary
+            # 先完成全部参数校验（含预算），再触碰数据库：预算无效优先于
+            # 数据库路径无效，且失败时不创建数据库文件。
             submitter = _clean_name("提交人(submitter)", args.submitter)
-            result = _summarize_expenses(args.db, submitter)
+            budget_minor = (
+                parse_budget(args.budget) if args.budget is not None else None
+            )
+            result = _summarize_expenses(args.db, submitter, budget_minor)
             print(json.dumps(result, ensure_ascii=False))
             return 0
     except ValidationError as exc:
