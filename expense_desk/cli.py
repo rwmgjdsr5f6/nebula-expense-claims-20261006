@@ -1,6 +1,6 @@
-"""命令行接口：提交报销单、按提交人查询。
+"""命令行接口：提交报销单、按提交人查询与汇总。
 
-入口：``python -m expense_desk --db <SQLite 文件> <submit|list> ...``
+入口：``python -m expense_desk --db <SQLite 文件> <submit|list|summary> ...``
 
 仅依赖 Python 3 标准库，金额以整数分（人民币）存储，不经过浮点运算。
 """
@@ -77,7 +77,7 @@ def _clean_name(field_label: str, value: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m expense_desk",
-        description="本地费用报销台：提交报销单或按提交人查询。",
+        description="本地费用报销台：提交报销单、按提交人查询或汇总。",
     )
     parser.add_argument(
         "--db",
@@ -93,6 +93,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = subparsers.add_parser("list", help="按提交人查询报销单")
     listing.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+
+    summary = subparsers.add_parser("summary", help="按提交人汇总笔数与金额")
+    summary.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
 
     return parser
 
@@ -142,6 +145,28 @@ def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
     ]
 
 
+def _summarize_expenses(db_path: str, submitter: str) -> dict[str, object]:
+    conn = _connect(db_path)
+    try:
+        conn.execute(_SCHEMA)
+        rows = conn.execute(
+            "SELECT amount_minor FROM expenses WHERE submitter = ?",
+            (submitter,),
+        ).fetchall()
+    finally:
+        conn.close()
+    # 在 Python 中按任意精度整数求和：SQLite 的 SUM() 在合计超过
+    # 64 位有符号整数上限时会报整数溢出，这里逐行累加不受该限制。
+    total = 0
+    for row in rows:
+        total += int(row[0])
+    return {
+        "submitter": submitter,
+        "count": len(rows),
+        "total_amount_minor": total,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -162,10 +187,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "amount_minor": amount_minor,
                 "status": STATUS_PENDING,
             }
-        else:  # list
+        elif args.command == "list":
             submitter = _clean_name("提交人(submitter)", args.submitter)
             records = _query_expenses(args.db, submitter)
             print(json.dumps(records, ensure_ascii=False))
+            return 0
+        else:  # summary
+            submitter = _clean_name("提交人(submitter)", args.submitter)
+            result = _summarize_expenses(args.db, submitter)
+            print(json.dumps(result, ensure_ascii=False))
             return 0
     except ValidationError as exc:
         print(f"参数错误: {exc}", file=sys.stderr)
