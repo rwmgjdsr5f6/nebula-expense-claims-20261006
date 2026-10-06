@@ -1,6 +1,6 @@
 """命令行接口：提交报销单、按提交人查询与汇总。
 
-入口：``python -m expense_desk --db <SQLite 文件> <submit|list|summary> ...``
+入口：``python -m expense_desk --db <SQLite 文件> <submit|list|summary|export> ...``
 
 仅依赖 Python 3 标准库，金额以整数分（人民币）存储，不经过浮点运算。
 """
@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import sqlite3
@@ -18,6 +19,9 @@ from typing import Sequence
 MAX_AMOUNT_MINOR = 2**63 - 1
 
 STATUS_PENDING = "pending"
+
+#: CSV 导出的固定表头，与查询返回的字段顺序一致。
+CSV_HEADER = ("id", "submitter", "purpose", "amount_minor", "status")
 
 # 整数部分为一或多个 ASCII 数字；小数部分要么没有，要么为小数点加一至两位。
 # 显式 ASCII 锚定，拒绝全角数字、科学计数法、正负号、千分位等写法。
@@ -111,6 +115,9 @@ def build_parser() -> argparse.ArgumentParser:
     summary = subparsers.add_parser("summary", help="按提交人汇总笔数与金额")
     summary.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
 
+    export = subparsers.add_parser("export", help="按提交人导出报销单 CSV 到标准输出")
+    export.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+
     return parser
 
 
@@ -181,6 +188,19 @@ def _summarize_expenses(db_path: str, submitter: str) -> dict[str, object]:
     }
 
 
+def _write_csv(records: list[dict[str, object]]) -> None:
+    """把报销单记录按 CSV 写入标准输出。
+
+    使用标准库 csv 模块的最小引用规则：含逗号、双引号或换行的字段
+    自动加双引号，字段内双引号写成两个双引号；每条记录以 CRLF 结束。
+    金额（分）按完整十进制整数输出，状态与文本字段原样保留。
+    """
+    writer = csv.writer(sys.stdout, lineterminator="\r\n")
+    writer.writerow(CSV_HEADER)
+    for record in records:
+        writer.writerow([record[field] for field in CSV_HEADER])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -205,6 +225,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             submitter = _clean_name("提交人(submitter)", args.submitter)
             records = _query_expenses(args.db, submitter)
             print(json.dumps(records, ensure_ascii=False))
+            return 0
+        elif args.command == "export":
+            submitter = _clean_name("提交人(submitter)", args.submitter)
+            # 先取回全部记录再写 CSV：数据库失败时不输出任何内容（含表头）。
+            records = _query_expenses(args.db, submitter)
+            _write_csv(records)
             return 0
         else:  # summary
             submitter = _clean_name("提交人(submitter)", args.submitter)
