@@ -55,16 +55,30 @@ def parse_amount(raw: str) -> int:
             "金额格式无效，仅接受 ASCII 数字整数，或整数部分加小数点及一至两位小数"
         )
     whole, fraction = match.group(1), match.group(2)
-    # 通过字符串拼接补到两位小数后整体转整数，避免任何浮点舍入。
-    minor = int(whole + ((fraction + "00")[:2] if fraction is not None else "00"))
-    if minor <= 0:
-        raise ValidationError("金额必须大于零")
-    if minor > MAX_AMOUNT_MINOR:
+    # 通过字符串拼接补到两位小数，避免任何浮点舍入。
+    frac2 = (fraction + "00")[:2] if fraction is not None else "00"
+    # 先去掉整数部分的前导零：前导零不改变数值，也不应计入长度判断。
+    whole_significant = whole.lstrip("0")
+    if not whole_significant:
+        # 整数部分全为零，数值完全由两位小数决定（0 到 99 分）。
+        minor = int(frac2)
+        if minor == 0:
+            raise ValidationError("金额必须大于零")
+        return minor
+    digits = whole_significant + frac2
+    # 用十进制字符串按长度再按字典序与上限比较，避免把超长数字串交给
+    # int()：Python 默认的整数转换长度限制会对超长输入抛出 ValueError，
+    # 该异常不属于参数校验错误，会越过统一的错误处理。
+    max_digits = str(MAX_AMOUNT_MINOR)
+    if len(digits) > len(max_digits) or (
+        len(digits) == len(max_digits) and digits > max_digits
+    ):
         raise ValidationError(
             "金额换算为分后超过 SQLite 64 位有符号整数上限 "
             f"({MAX_AMOUNT_MINOR})"
         )
-    return minor
+    # 至此数字串长度不超过上限的位数，int() 转换必然成功。
+    return int(digits)
 
 
 def _clean_name(field_label: str, value: str) -> str:
