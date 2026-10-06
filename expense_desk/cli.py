@@ -33,13 +33,26 @@ CREATE TABLE IF NOT EXISTS expenses (
     submitter TEXT NOT NULL,
     purpose TEXT NOT NULL,
     amount_minor INTEGER NOT NULL CHECK (amount_minor > 0),
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    attachment_note TEXT
 )
 """
+
+#: 可选附件文字说明列；旧库（五列结构）经 ALTER TABLE 补齐此列。
+ATTACHMENT_NOTE_COLUMN = "attachment_note"
 
 
 class ValidationError(ValueError):
     """参数校验失败（退出码 2）。"""
+
+
+class _ExpenseArgumentParser(argparse.ArgumentParser):
+    """把附件说明缺少参数值的报错改为明确的中文提示。"""
+
+    def error(self, message: str) -> None:
+        if "attachment-note" in message and "expected one argument" in message:
+            message = "参数 --attachment-note 缺少参数值"
+        super().error(message)
 
 
 def parse_amount(raw: str) -> int:
@@ -106,7 +119,7 @@ def _clean_name(field_label: str, value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _ExpenseArgumentParser(
         prog="python -m expense_desk",
         description="本地费用报销台：提交报销单、按提交人查询或汇总。",
     )
@@ -121,6 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--submitter", required=True, help="提交人")
     submit.add_argument("--purpose", required=True, help="费用用途")
     submit.add_argument("--amount", required=True, help="人民币金额（元）")
+    submit.add_argument(
+        "--attachment-note",
+        help=(
+            "可选的附件文字说明：仅作为普通文本随单保存，不读取文件或访问网络；"
+            "去除首尾空白，内部空格、中文、逗号、双引号与换行原样保留"
+        ),
+    )
 
     listing = subparsers.add_parser("list", help="按提交人查询报销单")
     listing.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
@@ -143,17 +163,43 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(db_path)
 
 
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """建表（新库直接含附件说明列），并为旧库补齐可选的附件说明列。
+
+    旧库的 expenses 表只有五个字段；ALTER TABLE ... ADD COLUMN 对旧记录
+    填入 NULL，旧记录读取时因此不输出 attachment_note 字段，其 id、金额、
+    用途与状态均保持原样。
+    """
+    conn.execute(_SCHEMA)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(expenses)").fetchall()
+    }
+    if ATTACHMENT_NOTE_COLUMN not in columns:
+        conn.execute(
+            f"ALTER TABLE expenses ADD COLUMN {ATTACHMENT_NOTE_COLUMN} TEXT"
+        )
+        # 显式提交：查询/汇总路径不在事务块中调用本函数，连接关闭时未提交
+        # 的变更会被回滚，旧库迁移将无法落盘。
+        conn.commit()
+
+
 def _insert_expense(
-    db_path: str, submitter: str, purpose: str, amount_minor: int
+    db_path: str,
+    submitter: str,
+    purpose: str,
+    amount_minor: int,
+    attachment_note: str | None = None,
 ) -> int:
     conn = _connect(db_path)
     try:
         with conn:  # 提交失败时自动回滚，保证失败提交不留记录
-            conn.execute(_SCHEMA)
+            _ensure_schema(conn)
             cursor = conn.execute(
-                "INSERT INTO expenses (submitter, purpose, amount_minor, status)"
-                " VALUES (?, ?, ?, ?)",
-                (submitter, purpose, amount_minor, STATUS_PENDING),
+                "INSERT INTO expenses"
+                " (submitter, purpose, amount_minor, status, attachment_note)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (submitter, purpose, amount_minor, STATUS_PENDING, attachment_note),
             )
             return int(cursor.lastrowid)
     finally:
@@ -163,24 +209,28 @@ def _insert_expense(
 def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
     conn = _connect(db_path)
     try:
-        conn.execute(_SCHEMA)
+        _ensure_schema(conn)
         rows = conn.execute(
-            "SELECT id, submitter, purpose, amount_minor, status"
+            "SELECT id, submitter, purpose, amount_minor, status, attachment_note"
             " FROM expenses WHERE submitter = ? ORDER BY id ASC",
             (submitter,),
         ).fetchall()
     finally:
         conn.close()
-    return [
-        {
+    records: list[dict[str, object]] = []
+    for row in rows:
+        record: dict[str, object] = {
             "id": row[0],
             "submitter": row[1],
             "purpose": row[2],
             "amount_minor": row[3],
             "status": row[4],
         }
-        for row in rows
-    ]
+        # 仅带说明的新记录追加该字段；旧记录（NULL）保持原有五个字段。
+        if row[5] is not None:
+            record["attachment_note"] = row[5]
+        records.append(record)
+    return records
 
 
 def _summarize_expenses(
@@ -188,7 +238,7 @@ def _summarize_expenses(
 ) -> dict[str, object]:
     conn = _connect(db_path)
     try:
-        conn.execute(_SCHEMA)
+        _ensure_schema(conn)
         rows = conn.execute(
             "SELECT amount_minor FROM expenses WHERE submitter = ?",
             (submitter,),
@@ -236,16 +286,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             submitter = _clean_name("提交人(submitter)", args.submitter)
             purpose = _clean_name("用途(purpose)", args.purpose)
             amount_minor = parse_amount(args.amount)
+            # 附件说明校验排在提交人、用途、金额之后、数据库操作之前：
+            # 显式空串或仅含空白时拒绝（退出码 2），且不创建数据库文件。
+            attachment_note = None
+            if args.attachment_note is not None:
+                attachment_note = args.attachment_note.strip()
+                if not attachment_note:
+                    raise ValidationError("附件说明不能为空")
             record_id = _insert_expense(
-                args.db, submitter, purpose, amount_minor
+                args.db, submitter, purpose, amount_minor, attachment_note
             )
-            record = {
+            record: dict[str, object] = {
                 "id": record_id,
                 "submitter": submitter,
                 "purpose": purpose,
                 "amount_minor": amount_minor,
                 "status": STATUS_PENDING,
             }
+            # 仅在提供说明时追加字段；未提供的记录保持原有五个字段。
+            if attachment_note is not None:
+                record["attachment_note"] = attachment_note
         elif args.command == "list":
             submitter = _clean_name("提交人(submitter)", args.submitter)
             records = _query_expenses(args.db, submitter)
