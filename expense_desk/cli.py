@@ -224,6 +224,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     export = subparsers.add_parser("export", help="按提交人导出报销单 CSV 到标准输出")
     export.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+    export.add_argument(
+        "--status",
+        help="可选状态筛选：仅接受区分大小写的 pending 或 approved",
+    )
 
     return parser
 
@@ -466,9 +470,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(records, ensure_ascii=False))
             return 0
         elif args.command == "export":
+            # 提交人校验先于状态校验，两者均在数据库操作前完成：提交人有效
+            # 而状态与数据库路径同时无效时，优先报告状态错误，不创建数据库文件。
             submitter = _clean_name("提交人(submitter)", args.submitter)
+            status = (
+                parse_status(args.status) if args.status is not None else None
+            )
             # 先取回全部记录再写 CSV：数据库失败时不输出任何内容（含表头）。
-            records = _query_expenses(args.db, submitter)
+            records = _query_expenses(args.db, submitter, status)
             _write_csv(records)
             return 0
         else:  # summary
