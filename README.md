@@ -36,6 +36,8 @@ python -m expense_desk --db demo.sqlite submit \
 python -m expense_desk --db demo.sqlite list --submitter 演示甲
 ```
 
+list 可另加可选的 `--status`：去除首尾空白后仅接受区分大小写的 `pending` 与 `approved`，记录须同时满足提交人与状态才进入结果；省略时查询范围、返回内容与排序不变。空串、纯空白、大小写不同或其他取值退出码 2 并提示“状态无效”，缺少参数值退出码 2 并指出 `--status`；提交人校验先于状态校验，两者都在数据库操作前完成。筛选只作用于本次查询，不保存选择，也不新增或修改记录。
+
 按编号批准单张报销单，把该单状态由 `pending` 改为 `approved`：
 
 ```sh

@@ -59,6 +59,8 @@ class _ExpenseArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         if "attachment-note" in message and "expected one argument" in message:
             message = "参数 --attachment-note 缺少参数值"
+        elif "--status" in message and "expected one argument" in message:
+            message = "参数 --status 缺少参数值"
         elif "--id" in message and "expected one argument" in message:
             message = "参数 --id 缺少参数值"
         elif "required" in message:
@@ -163,6 +165,18 @@ def _clean_name(field_label: str, value: str) -> str:
     return cleaned
 
 
+def parse_status(raw: str) -> str:
+    """校验 list 的可选状态筛选值。
+
+    去除首尾空白后只接受区分大小写的 ``pending`` 与 ``approved``；空串、
+    纯空白、大小写不同或其他取值一律抛出 :class:`ValidationError`。
+    """
+    text = raw.strip()
+    if text not in (STATUS_PENDING, STATUS_APPROVED):
+        raise ValidationError("状态无效：仅接受区分大小写的 pending 或 approved")
+    return text
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _ExpenseArgumentParser(
         prog="python -m expense_desk",
@@ -189,6 +203,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = subparsers.add_parser("list", help="按提交人查询报销单")
     listing.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+    listing.add_argument(
+        "--status",
+        help="可选状态筛选：仅接受区分大小写的 pending 或 approved",
+    )
 
     approve = subparsers.add_parser("approve", help="按编号批准单张报销单")
     approve.add_argument("--id", required=True, help="报销单编号（1 至 64 位有符号整数上限的正整数）")
@@ -319,15 +337,25 @@ def _approve_expense(db_path: str, expense_id: int) -> dict[str, object]:
     return record
 
 
-def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
+def _query_expenses(
+    db_path: str, submitter: str, status: str | None = None
+) -> list[dict[str, object]]:
     conn = _connect(db_path)
     try:
         _ensure_schema(conn)
-        rows = conn.execute(
-            f"SELECT {_EXPENSE_COLUMNS}"
-            " FROM expenses WHERE submitter = ? ORDER BY id ASC",
-            (submitter,),
-        ).fetchall()
+        if status is None:
+            rows = conn.execute(
+                f"SELECT {_EXPENSE_COLUMNS}"
+                " FROM expenses WHERE submitter = ? ORDER BY id ASC",
+                (submitter,),
+            ).fetchall()
+        else:
+            # 状态筛选只作用于本次查询：记录须同时匹配提交人与状态。
+            rows = conn.execute(
+                f"SELECT {_EXPENSE_COLUMNS}"
+                " FROM expenses WHERE submitter = ? AND status = ? ORDER BY id ASC",
+                (submitter, status),
+            ).fetchall()
     finally:
         conn.close()
     return [_record_from_row(row) for row in rows]
@@ -412,8 +440,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             expense_id = parse_expense_id(args.id)
             record = _approve_expense(args.db, expense_id)
         elif args.command == "list":
+            # 提交人校验先于状态校验，两者均在数据库操作前完成：提交人有效
+            # 而状态与数据库路径同时无效时，优先报告状态错误，不创建数据库文件。
             submitter = _clean_name("提交人(submitter)", args.submitter)
-            records = _query_expenses(args.db, submitter)
+            status = (
+                parse_status(args.status) if args.status is not None else None
+            )
+            records = _query_expenses(args.db, submitter, status)
             print(json.dumps(records, ensure_ascii=False))
             return 0
         elif args.command == "export":
