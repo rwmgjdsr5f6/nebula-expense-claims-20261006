@@ -1,6 +1,6 @@
-"""命令行接口：提交报销单、按提交人查询与汇总。
+"""命令行接口：提交、批准报销单、按提交人查询、汇总与导出。
 
-入口：``python -m expense_desk --db <SQLite 文件> <submit|list|summary|export> ...``
+入口：``python -m expense_desk --db <SQLite 文件> <submit|approve|list|summary|export> ...``
 
 仅依赖 Python 3 标准库，金额以整数分（人民币）存储，不经过浮点运算。
 """
@@ -19,6 +19,10 @@ from typing import Sequence
 MAX_AMOUNT_MINOR = 2**63 - 1
 
 STATUS_PENDING = "pending"
+STATUS_APPROVED = "approved"
+
+#: 报销单编号上限：SQLite INTEGER（64 位有符号整数主键）的最大值。
+MAX_EXPENSE_ID = 2**63 - 1
 
 #: CSV 导出的固定表头，与查询返回的字段顺序一致。
 CSV_HEADER = ("id", "submitter", "purpose", "amount_minor", "status")
@@ -26,6 +30,9 @@ CSV_HEADER = ("id", "submitter", "purpose", "amount_minor", "status")
 # 整数部分为一或多个 ASCII 数字；小数部分要么没有，要么为小数点加一至两位。
 # 显式 ASCII 锚定，拒绝全角数字、科学计数法、正负号、千分位等写法。
 _AMOUNT_RE = re.compile(r"\A([0-9]+)(?:\.([0-9]{1,2}))?\Z", re.ASCII)
+
+#: 编号去除首尾空白后必须只由 ASCII 数字组成（允许前导零），数值范围再单独判断。
+_ID_RE = re.compile(r"\A[0-9]+\Z", re.ASCII)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS expenses (
@@ -47,11 +54,19 @@ class ValidationError(ValueError):
 
 
 class _ExpenseArgumentParser(argparse.ArgumentParser):
-    """把附件说明缺少参数值的报错改为明确的中文提示。"""
+    """把缺少参数/参数值的报错改为明确指出参数名的中文提示。"""
 
     def error(self, message: str) -> None:
         if "attachment-note" in message and "expected one argument" in message:
             message = "参数 --attachment-note 缺少参数值"
+        elif "--id" in message and "expected one argument" in message:
+            message = "参数 --id 缺少参数值"
+        elif "required" in message:
+            # 缺少必需参数：argparse 的信息里带有具体参数名（如 --db、--id）。
+            if "--id" in message:
+                message = "缺少必需参数 --id（报销单编号）"
+            elif "--db" in message:
+                message = "缺少必需参数 --db（SQLite 数据库文件路径）"
         super().error(message)
 
 
@@ -111,6 +126,36 @@ def parse_budget(raw: str) -> int:
         raise ValidationError(f"预算无效：{exc}") from None
 
 
+def parse_expense_id(raw: str) -> int:
+    """把 ``--id`` 的原始字符串解析为报销单编号正整数。
+
+    去除首尾空白后只接受 ASCII 数字组成的字符串（允许前导零），数值须在
+    1 至 :data:`MAX_EXPENSE_ID`（SQLite 64 位有符号整数上限）之间。
+    空串、零、负数、小数、带正号、非 ASCII 数字（如全角数字）与越界值
+    一律抛出 :class:`ValidationError`。
+
+    超长数字串先按十进制字符串与上限比较，不直接交给 ``int()``：Python 的
+    整数转换长度限制可能对超长输入抛出与编号校验无关的 ValueError。
+    """
+    text = raw.strip()
+    if not text or _ID_RE.fullmatch(text) is None:
+        raise ValidationError(
+            "编号无效：去除首尾空白后只能由 ASCII 数字组成，且不能带正负号或小数点"
+        )
+    significant = text.lstrip("0")
+    if not significant:
+        # 全为零（含 "0" 与任意位数的前导零）：编号必须为正整数。
+        raise ValidationError("编号无效：编号必须是不小于 1 的正整数")
+    max_digits = str(MAX_EXPENSE_ID)
+    if len(significant) > len(max_digits) or (
+        len(significant) == len(max_digits) and significant > max_digits
+    ):
+        raise ValidationError(
+            f"编号无效：编号不得超过 64 位有符号整数上限 ({MAX_EXPENSE_ID})"
+        )
+    return int(significant)
+
+
 def _clean_name(field_label: str, value: str) -> str:
     cleaned = value.strip()
     if not cleaned:
@@ -144,6 +189,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = subparsers.add_parser("list", help="按提交人查询报销单")
     listing.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
+
+    approve = subparsers.add_parser("approve", help="按编号批准单张报销单")
+    approve.add_argument("--id", required=True, help="报销单编号（1 至 64 位有符号整数上限的正整数）")
 
     summary = subparsers.add_parser("summary", help="按提交人汇总笔数与金额")
     summary.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
@@ -206,31 +254,83 @@ def _insert_expense(
         conn.close()
 
 
+def _record_from_row(row: sqlite3.Row | tuple) -> dict[str, object]:
+    """把一行六列查询结果组装为对外的记录字典。
+
+    字段顺序与 list 单条记录一致：id、提交人、用途、整数分金额、状态；
+    附件说明仅在非 NULL（带说明的新记录）时追加，旧记录保持五个字段。
+    """
+    record: dict[str, object] = {
+        "id": row[0],
+        "submitter": row[1],
+        "purpose": row[2],
+        "amount_minor": row[3],
+        "status": row[4],
+    }
+    if row[5] is not None:
+        record["attachment_note"] = row[5]
+    return record
+
+
+_EXPENSE_COLUMNS = (
+    "id, submitter, purpose, amount_minor, status, attachment_note"
+)
+
+
+def _approve_expense(db_path: str, expense_id: int) -> dict[str, object]:
+    """按编号把单张报销单由 pending 批准为 approved 并返回该记录。
+
+    - 编号不存在（含父目录存在的新库）：抛出 :class:`ValidationError`
+      （“报销单不存在”，退出码 2），不新增任何记录；
+    - 当前状态为 approved：幂等返回同一记录，不执行写入、不改变记录；
+    - 当前状态既不是 pending 也不是 approved：抛出 :class:`ValidationError`
+      （“当前状态不能批准”，退出码 2），不改变记录；
+    - pending：更新为 approved 并随事务提交，进程退出后新进程仍可读到。
+
+    旧库（五列结构）先经 :func:`_ensure_schema` 补齐附件说明列，读取与
+    返回均保留编号、提交人、用途、整数分金额与附件文本。
+    """
+    conn = _connect(db_path)
+    try:
+        with conn:  # 异常时自动回滚，保证失败批准不改任何记录
+            _ensure_schema(conn)
+            row = conn.execute(
+                f"SELECT {_EXPENSE_COLUMNS} FROM expenses WHERE id = ?",
+                (expense_id,),
+            ).fetchone()
+            if row is None:
+                raise ValidationError("报销单不存在")
+            status = row[4]
+            if status == STATUS_APPROVED:
+                # 已批准：幂等成功，不更新、不改写任何字段。
+                return _record_from_row(row)
+            if status != STATUS_PENDING:
+                raise ValidationError("当前状态不能批准")
+            conn.execute(
+                "UPDATE expenses SET status = ? WHERE id = ?",
+                (STATUS_APPROVED, expense_id),
+            )
+            approved_row = (
+                row[0], row[1], row[2], row[3], STATUS_APPROVED, row[5]
+            )
+            record = _record_from_row(approved_row)
+    finally:
+        conn.close()
+    return record
+
+
 def _query_expenses(db_path: str, submitter: str) -> list[dict[str, object]]:
     conn = _connect(db_path)
     try:
         _ensure_schema(conn)
         rows = conn.execute(
-            "SELECT id, submitter, purpose, amount_minor, status, attachment_note"
+            f"SELECT {_EXPENSE_COLUMNS}"
             " FROM expenses WHERE submitter = ? ORDER BY id ASC",
             (submitter,),
         ).fetchall()
     finally:
         conn.close()
-    records: list[dict[str, object]] = []
-    for row in rows:
-        record: dict[str, object] = {
-            "id": row[0],
-            "submitter": row[1],
-            "purpose": row[2],
-            "amount_minor": row[3],
-            "status": row[4],
-        }
-        # 仅带说明的新记录追加该字段；旧记录（NULL）保持原有五个字段。
-        if row[5] is not None:
-            record["attachment_note"] = row[5]
-        records.append(record)
-    return records
+    return [_record_from_row(row) for row in rows]
 
 
 def _summarize_expenses(
@@ -306,6 +406,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             # 仅在提供说明时追加字段；未提供的记录保持原有五个字段。
             if attachment_note is not None:
                 record["attachment_note"] = attachment_note
+        elif args.command == "approve":
+            # 编号校验先于一切数据库操作：编号与数据库路径同时无效时优先报告
+            # 编号错误（退出码 2），且不创建数据库文件。
+            expense_id = parse_expense_id(args.id)
+            record = _approve_expense(args.db, expense_id)
         elif args.command == "list":
             submitter = _clean_name("提交人(submitter)", args.submitter)
             records = _query_expenses(args.db, submitter)
