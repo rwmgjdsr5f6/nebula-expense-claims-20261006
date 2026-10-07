@@ -217,6 +217,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--budget",
         help="可选的一次性预算参考（人民币元）；提供时额外返回预算分与余额分",
     )
+    summary.add_argument(
+        "--status",
+        help="可选状态筛选：仅接受区分大小写的 pending 或 approved",
+    )
 
     export = subparsers.add_parser("export", help="按提交人导出报销单 CSV 到标准输出")
     export.add_argument("--submitter", required=True, help="提交人（完整名称精确匹配）")
@@ -362,15 +366,27 @@ def _query_expenses(
 
 
 def _summarize_expenses(
-    db_path: str, submitter: str, budget_minor: int | None = None
+    db_path: str,
+    submitter: str,
+    budget_minor: int | None = None,
+    status: str | None = None,
 ) -> dict[str, object]:
     conn = _connect(db_path)
     try:
         _ensure_schema(conn)
-        rows = conn.execute(
-            "SELECT amount_minor FROM expenses WHERE submitter = ?",
-            (submitter,),
-        ).fetchall()
+        if status is None:
+            rows = conn.execute(
+                "SELECT amount_minor FROM expenses WHERE submitter = ?",
+                (submitter,),
+            ).fetchall()
+        else:
+            # 状态筛选只作用于当次汇总：记录须同时匹配提交人与状态，
+            # 不保存筛选选择、不修改任何费用记录。
+            rows = conn.execute(
+                "SELECT amount_minor FROM expenses"
+                " WHERE submitter = ? AND status = ?",
+                (submitter, status),
+            ).fetchall()
     finally:
         conn.close()
     # 在 Python 中按任意精度整数求和：SQLite 的 SUM() 在合计超过
@@ -456,13 +472,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write_csv(records)
             return 0
         else:  # summary
-            # 先完成全部参数校验（含预算），再触碰数据库：预算无效优先于
-            # 数据库路径无效，且失败时不创建数据库文件。
+            # 业务校验按提交人、预算、状态的顺序进行，全部通过后才触碰数据库：
+            # 预算与状态同时无效时报告预算错误；状态与数据库路径同时无效时
+            # 报告状态错误，且不创建数据库文件。
             submitter = _clean_name("提交人(submitter)", args.submitter)
             budget_minor = (
                 parse_budget(args.budget) if args.budget is not None else None
             )
-            result = _summarize_expenses(args.db, submitter, budget_minor)
+            status = (
+                parse_status(args.status) if args.status is not None else None
+            )
+            result = _summarize_expenses(args.db, submitter, budget_minor, status)
             print(json.dumps(result, ensure_ascii=False))
             return 0
     except ValidationError as exc:
